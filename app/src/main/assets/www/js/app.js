@@ -2,12 +2,11 @@
 // editing, analysis requests and drawing.
 import { TABLE, applyH, v } from './geom.js';
 import {
-  detectTable, calibrate, detectBalls, alignQuad, hsvArrays, BALL_HE, BALL_HEX, BALL_COLORS,
+  detectTable, calibrate, detectBalls, findBallAt, alignQuad, hsvArrays, BALL_HE, BALL_HEX, BALL_COLORS,
 } from './vision.js';
 import { thicknessLabel, POCKETS } from './shots.js';
 import { Renderer } from './render.js';
 import { ballSVG, elevationSVG, tipWords, tipMm, mountTipPad } from './tip.js';
-import { DemoCamera } from './demo.js';
 
 const $ = (s) => document.querySelector(s);
 const cv = $('#cv'), ctx = cv.getContext('2d');
@@ -24,7 +23,7 @@ function loadSettings() {
 function saveSettings() { try { localStorage.setItem('se.settings.v3', JSON.stringify(S.set)); } catch { /* storage unavailable */ } }
 
 const S = {
-  mode: 'photo', source: 'camera', camReady: false, camError: null,
+  mode: 'photo', camReady: false, camError: null, tracks: [], lost: 0, cut: false,
   frozen: null, frozenW: 0, frozenH: 0,
   quad: null, calib: null, hue: null, orient: 'auto', tableSeen: false,
   balls: [], nextId: 1, selId: null,
@@ -34,7 +33,6 @@ const S = {
   lastProc: 0, lastTableProbe: 0, quadHistory: [],
 };
 
-const demo = new DemoCamera(1280, 720);
 
 // ---------------- analysis worker ----------------
 let worker = null, seq = 0, pending = false, dirty = false, lastAnalyzed = null;
@@ -102,9 +100,21 @@ async function startCamera() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('no-media');
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: false,
-    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    video: {
+      facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 },
+      frameRate: { ideal: 30 },
+    },
   });
   vid.srcObject = stream;
+  const track0 = stream.getVideoTracks()[0];
+  try {
+    const caps = track0.getCapabilities ? track0.getCapabilities() : {};
+    const adv = {};
+    if (caps.focusMode && caps.focusMode.includes('continuous')) adv.focusMode = 'continuous';
+    if (caps.exposureMode && caps.exposureMode.includes('continuous')) adv.exposureMode = 'continuous';
+    if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous')) adv.whiteBalanceMode = 'continuous';
+    if (Object.keys(adv).length) await track0.applyConstraints({ advanced: [adv] });
+  } catch { /* optional camera features */ }
   await vid.play().catch(() => {});
   await new Promise((r) => { if (vid.videoWidth) r(); else vid.onloadedmetadata = () => r(); });
   S.camReady = true;
@@ -112,7 +122,6 @@ async function startCamera() {
 
 function source() {
   if (S.mode === 'photo' && S.frozen) return { el: S.frozen, w: S.frozenW, h: S.frozenH, live: false };
-  if (S.source === 'demo') return { el: demo.canvas, w: demo.w, h: demo.h, live: true };
   if (S.camReady && vid.videoWidth) return { el: vid, w: vid.videoWidth, h: vid.videoHeight, live: true };
   return null;
 }
@@ -127,77 +136,112 @@ function grab(src, maxSide) {
   return { img, k, hsv: hsvArrays(img) };
 }
 
+// High-resolution crop around the table for ball detection.
+const proc2 = document.createElement('canvas');
+const pctx2 = proc2.getContext('2d', { willReadFrequently: true });
+function grabTable(src, calib, maxSide) {
+  const { L, W } = TABLE, m = 140;
+  const pts = [{ x: -m, y: -m }, { x: L + m, y: -m }, { x: L + m, y: W + m }, { x: -m, y: W + m }].map((p) => applyH(calib.Hb, p));
+  let x0 = Math.max(0, Math.floor(Math.min(...pts.map((p) => p.x)))), x1 = Math.min(src.w, Math.ceil(Math.max(...pts.map((p) => p.x))));
+  let y0 = Math.max(0, Math.floor(Math.min(...pts.map((p) => p.y)))), y1 = Math.min(src.h, Math.ceil(Math.max(...pts.map((p) => p.y))));
+  if (x1 - x0 < 20 || y1 - y0 < 20) return null;
+  const k = Math.min(1, maxSide / Math.max(x1 - x0, y1 - y0));
+  const w = Math.max(1, Math.round((x1 - x0) * k)), h = Math.max(1, Math.round((y1 - y0) * k));
+  if (proc2.width !== w || proc2.height !== h) { proc2.width = w; proc2.height = h; }
+  pctx2.drawImage(src.el, x0, y0, x1 - x0, y1 - y0, 0, 0, w, h);
+  const img = pctx2.getImageData(0, 0, w, h);
+  return { img, xf: { k, ox: x0, oy: y0 }, hsv: hsvArrays(img) };
+}
+
 function setCalibFromQuad(quad, w, h) {
   const c = calibrate(quad, w, h, Number(S.set.margin), S.orient);
   if (!c) return false;
   if (S.orient === 'auto' && S.mode !== 'photo') S.orient = c.orient;
   S.quad = quad; S.calib = c;
+  const bm = Math.min(w, h) * 0.012;
+  S.cut = quad.some((p) => p.x < bm || p.y < bm || p.x > w - bm || p.y > h - bm);
   return true;
 }
 
-// simple multi-object tracker in table coordinates
+// Tracker in table coordinates. A detection must be seen in several frames
+// before it is shown, and positions are smoothed with a small dead band so
+// the markers stand still on a still table.
 function track(dets) {
+  if (S.ignore && S.ignore.length) dets = dets.filter((d) => !S.ignore.some((q) => Math.hypot(q.x - d.x, q.y - d.y) < 45));
   const out = [];
   const used = new Set();
-  const tracks = S.balls;
-  for (const t of tracks) {
-    let best = null, bd = 70;
+  for (const t of S.tracks) {
+    let best = null, bd = t.manual ? 90 : 75;
     dets.forEach((d, i) => {
-      if (used.has(i) || d.color !== t.color) return;
+      if (used.has(i)) return;
+      if (!t.manual && d.color !== t.color && !(t.hits < 3)) return;
       const dd = Math.hypot(d.x - t.x, d.y - t.y);
       if (dd < bd) { bd = dd; best = i; }
     });
     if (best != null) {
       used.add(best);
       const d = dets[best];
-      const a = bd > 30 ? 1 : 0.45;
-      out.push({ ...t, x: t.x + (d.x - t.x) * a, y: t.y + (d.y - t.y) * a, img: d.img, miss: 0 });
-    } else if ((t.miss || 0) < 5) out.push({ ...t, miss: (t.miss || 0) + 1 });
+      let x = t.x, y = t.y;
+      if (bd > 40) { x = d.x; y = d.y; } else if (bd > 3) { x += (d.x - t.x) * 0.35; y += (d.y - t.y) * 0.35; }
+      const votes = { ...(t.votes || {}) }; votes[d.color] = (votes[d.color] || 0) + 1;
+      let color = t.color;
+      if (!t.manual) { let bv = 0; for (const c in votes) if (votes[c] > bv) { bv = votes[c]; color = c; } }
+      out.push({ ...t, x, y, color, votes, img: d.img, miss: 0, hits: Math.min(50, t.hits + 1) });
+    } else if (t.manual || t.miss < (t.hits >= 3 ? 10 : 2)) out.push({ ...t, miss: t.miss + 1 });
   }
-  dets.forEach((d, i) => { if (!used.has(i)) out.push({ ...d, id: S.nextId++, miss: 0 }); });
-  S.balls = out;
+  dets.forEach((d, i) => { if (!used.has(i)) out.push({ ...d, id: S.nextId++, miss: 0, hits: 1, votes: { [d.color]: 1 } }); });
+  S.tracks = out;
+  S.balls = out.filter((t) => t.manual || t.hits >= 3);
 }
 
-function processLive(src, now) {
-  const handheld = S.mode === 'hand';
+let procCost = 60;
+function processLive(src) {
+  const t0 = performance.now();
   const g = grab(src, 640);
   if (S.mode === 'photo') {
-    // framing helper: show detected table outline before taking the photo
     const t = detectTable(g.img, 1 / g.k, g.hsv);
     if (t.ok) { setCalibFromQuad(t.quad, src.w, src.h); S.hue = t.hue; S.tableSeen = true; }
-    else { S.tableSeen = false; S.calib = null; }
+    else { S.tableSeen = t.reason === 'cut'; S.cut = t.reason === 'cut'; S.calib = null; }
     S.balls = [];
     return;
   }
-  if (S.mode === 'tripod' && !S.locked) {
+  if ((S.mode === 'tripod' && !S.locked) || S.mode === 'hand') {
     const t = detectTable(g.img, 1 / g.k, g.hsv);
+    if (t.ok && S.quad && S.calib) {
+      // reject a sudden implausible change of the table's size on screen
+      const area = (q) => Math.abs(q.reduce((a, p, i) => { const n = q[(i + 1) % 4]; return a + p.x * n.y - n.x * p.y; }, 0) / 2);
+      const ratio = area(t.quad) / Math.max(1, area(S.quad));
+      if ((ratio < 0.6 || ratio > 1.65) && (S.lost || 0) < 8) { t.ok = false; t.reason = 'jump'; }
+    }
     if (t.ok) {
-      S.quadHistory.push(t.quad); if (S.quadHistory.length > 6) S.quadHistory.shift();
-      const q = S.quad ? alignQuad(S.quad, t.quad).quad : t.quad;
-      setCalibFromQuad(q, src.w, src.h); S.hue = t.hue; S.tableSeen = true;
-    } else S.tableSeen = false;
-  }
-  if (handheld) {
-    const t = detectTable(g.img, 1 / g.k, g.hsv);
-    if (t.ok) {
-      S.hue = t.hue;
+      S.hue = t.hue; S.lost = 0;
       let q = t.quad;
       if (S.quad) {
         const al = alignQuad(S.quad, t.quad);
         q = al.quad;
         const diag = Math.hypot(src.w, src.h);
-        const a = al.dist > diag * 0.06 ? 1 : 0.55;
+        const a = al.dist > diag * 0.05 ? 1 : (al.dist < diag * 0.004 ? 0.15 : 0.5);
         q = q.map((p, i) => ({ x: S.quad[i].x + (p.x - S.quad[i].x) * a, y: S.quad[i].y + (p.y - S.quad[i].y) * a }));
+        // a big jump of the view means the balls must be re-acquired
+        if (a === 1) { S.tracks = S.tracks.filter((x) => x.manual); S.ignore = []; }
       }
       setCalibFromQuad(q, src.w, src.h); S.tableSeen = true;
-    } else { S.tableSeen = false; }
+    } else {
+      S.lost = (S.lost || 0) + 1;
+      if (t.reason === 'cut') S.cut = true;
+      if (S.lost > 12) { S.tableSeen = false; }
+    }
   }
-  if (S.calib && S.hue != null && S.tableSeen !== false) {
-    const dets = detectBalls(g.img, S.calib, S.hue, g.k, g.hsv);
-    track(dets);
-    if (S.selId != null && !S.balls.some((b) => b.id === S.selId)) S.selId = null;
-    requestAnalysis();
+  if (S.calib && S.tableSeen !== false) {
+    const c = grabTable(src, S.calib, 1100);
+    if (c) {
+      const dets = detectBalls(c.img, S.calib, c.xf, c.hsv, { clothHue: S.hue });
+      track(dets);
+      if (S.selId != null && !S.balls.some((b) => b.id === S.selId)) S.selId = null;
+      requestAnalysis();
+    }
   }
+  procCost = procCost * 0.8 + (performance.now() - t0) * 0.2;
 }
 
 function capturePhoto() {
@@ -214,8 +258,9 @@ function capturePhoto() {
 
 function analyzeFrozen(detectQuad) {
   const src = { el: S.frozen, w: S.frozenW, h: S.frozenH };
-  const g = grab(src, 1280);
+  const keepManual = S.balls.filter((b) => b.manual);
   if (detectQuad || !S.quad) {
+    const g = grab(src, 960);
     const t = detectTable(g.img, 1 / g.k, g.hsv);
     if (!t.ok) {
       S.calib = null; S.balls = [];
@@ -229,12 +274,43 @@ function analyzeFrozen(detectQuad) {
     S.hue = t.hue;
     setCalibFromQuad(t.quad, src.w, src.h);
   } else setCalibFromQuad(S.quad, src.w, src.h);
-  const dets = detectBalls(g.img, S.calib, S.hue, g.k, g.hsv);
-  S.nextId = 1;
-  S.balls = dets.map((d) => ({ ...d, id: S.nextId++ }));
-  if (!S.balls.some((b) => b.color === 'white')) toast('לא נמצא כדור לבן – הוסף אותו ב"עריכת כדורים"');
+  const c = grabTable(src, S.calib, 2000);
+  const dets = c ? detectBalls(c.img, S.calib, c.xf, c.hsv, { clothHue: S.hue }) : [];
+  S.nextId = Math.max(S.nextId, 1);
+  S.balls = dets.map((d) => ({ ...d, id: S.nextId++ })).concat(detectQuad ? [] : keepManual);
+  if (!S.balls.some((b) => b.color === 'white')) toast('לא נמצא כדור לבן – גע בו כדי לסמן אותו');
   requestAnalysis(true);
   renderStatus();
+}
+
+// Tap on a spot where no ball is marked: search the image there.
+function tapFind(framePt, commit = true) {
+  const src = source();
+  if (!src || !S.calib) return null;
+  const c = grabTable(src, S.calib, S.mode === 'photo' ? 2000 : 1400);
+  if (!c) return null;
+  const r = findBallAt(c.img, S.calib, c.xf, framePt);
+  if (!r) return null;
+  const { L, W, R: RR } = TABLE;
+  if (r.x < -40 || r.y < -40 || r.x > L + 40 || r.y > W + 40) return null;
+  const b = {
+    id: 0, color: r.color, x: Math.min(L - RR, Math.max(RR, r.x)), y: Math.min(W - RR, Math.max(RR, r.y)),
+    manual: true, hits: 99, miss: 0, img: r.img,
+  };
+  if (!commit) return { ball: b, found: r.found };
+  return commitTap(b, r.found);
+}
+
+function commitTap(b, found) {
+  const RR = TABLE.R;
+  b.id = S.nextId++;
+  if (b.color !== 'red') for (const o of S.balls) if (o.color === b.color && o !== b) o.color = 'red';
+  // replace any nearby automatic detection
+  S.balls = S.balls.filter((o) => Math.hypot(o.x - b.x, o.y - b.y) > 2 * RR);
+  S.tracks = (S.tracks || []).filter((o) => Math.hypot(o.x - b.x, o.y - b.y) > 2 * RR);
+  S.balls.push(b);
+  if (S.mode !== 'photo') S.tracks.push(b);
+  return { ball: b, found };
 }
 
 function defaultQuad(w, h) {
@@ -251,17 +327,16 @@ function frame(ts) {
   if (cv.width !== Math.round(cw * dpr) || cv.height !== Math.round(ch * dpr)) { cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr); }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#05080c'; ctx.fillRect(0, 0, cw, ch);
-  if (S.source === 'demo' && !(S.mode === 'photo' && S.frozen)) demo.render(dt, S.mode === 'hand');
   const src = source();
   if (src) {
     const s = Math.min(cw / src.w, ch / src.h);
     const view = { s, ox: (cw - src.w * s) / 2, oy: (ch - src.h * s) / 2 };
     R.setView(view);
     ctx.drawImage(src.el, view.ox, view.oy, src.w * s, src.h * s);
-    const interval = S.mode === 'photo' ? 350 : 90;
+    const interval = S.mode === 'photo' ? 350 : Math.max(80, procCost * 1.6);
     if (src.live && ts - S.lastProc > interval) {
       S.lastProc = ts;
-      try { processLive(src, ts); } catch (e) { console.error(e); }
+      try { processLive(src); } catch (e) { console.error(e); }
       renderStatus();
     }
     try { drawOverlay(cw, ch); } catch (e) { console.error(e); }
@@ -425,10 +500,10 @@ $('#pClose').onclick = () => { S.selId = null; S.showRec = false; S.shots = []; 
 function renderStatus() {
   const st = $('#status');
   st.className = 'status';
-  if (S.camError && S.source === 'camera') { st.textContent = S.camError; st.classList.add('warn'); return; }
+  if (S.camError) { st.textContent = S.camError; st.classList.add('warn'); return; }
   if (S.mode === 'photo' && !S.frozen) {
-    st.textContent = S.tableSeen ? 'השולחן בפריים ✓ – צלם' : 'כוון את המצלמה כך שכל השולחן ייראה';
-    if (S.tableSeen) st.classList.add('ok');
+    st.textContent = !S.tableSeen ? 'כוון את המצלמה כך שכל השולחן ייראה' : (S.cut ? 'השולחן חתוך – התרחק או הרם את הטלפון' : 'השולחן בפריים ✓ – צלם');
+    if (S.tableSeen && !S.cut) st.classList.add('ok'); else if (S.cut) st.classList.add('warn');
     return;
   }
   if (!S.calib) { st.textContent = 'מחפש שולחן…'; return; }
@@ -436,7 +511,8 @@ function renderStatus() {
   const white = S.balls.some((b) => b.color === 'white');
   let t = `${S.mode === 'tripod' ? (S.locked ? '🔒 שולחן נעול' : 'שולחן זוהה') : 'שולחן'} · ${n} כדורים`;
   if (!white) t += ' · אין לבן';
-  if (S.calib.elev < 14) { t += ' · הרם את הטלפון לדיוק'; st.classList.add('warn'); } else st.classList.add('ok');
+  if (S.cut) { t += ' · השולחן חתוך – התרחק כדי שכל השולחן ייראה'; st.classList.add('warn'); }
+  else if (S.calib.elev < 14) { t += ' · הרם את הטלפון לדיוק'; st.classList.add('warn'); } else st.classList.add('ok');
   if (!S.selId && !S.showRec && n) t += ' · גע בכדור';
   st.textContent = t;
 }
@@ -498,7 +574,7 @@ function toast(msg) {
 }
 
 // ---------------- pointer interaction ----------------
-let dragCorner = -1, dragBall = null, downPt = null, moved = false;
+let dragCorner = -1, dragBall = null, downPt = null, moved = false, downT = 0, pressTimer = 0, longDone = false;
 
 function evPt(e) { const r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
 
@@ -507,7 +583,7 @@ function ballAtScreen(p) {
   let best = null, bd = Infinity;
   for (const b of S.balls) {
     const s = scrOf(b);
-    const r = Math.max(22, R.ballRadiusScr(b, S.calib.Hb) * 1.8);
+    const r = Math.max(12, R.ballRadiusScr(b, S.calib.Hb) * 1.5);
     const d = Math.hypot(s.x - p.x, s.y - p.y);
     if (d < r && d < bd) { bd = d; best = b; }
   }
@@ -521,7 +597,18 @@ function screenToTable(p) {
 
 cv.addEventListener('pointerdown', (e) => {
   cv.setPointerCapture(e.pointerId);
-  downPt = evPt(e); moved = false;
+  downPt = evPt(e); moved = false; downT = performance.now(); longDone = false;
+  clearTimeout(pressTimer);
+  if (!S.editCorners && !S.editBalls && S.calib) {
+    const at = downPt;
+    pressTimer = setTimeout(() => {
+      if (moved || !downPt) return;
+      const b = ballAtScreen(at);
+      longDone = true;
+      if (b) openBallSheet(b, null);
+      else openBallSheet(null, screenToTable(at));
+    }, 550);
+  }
   if (S.editCorners && S.quad) {
     let bi = -1, bd = 44;
     S.quad.forEach((q, i) => { const s = R.fr2scr(q); const d = Math.hypot(s.x - downPt.x, s.y - downPt.y); if (d < bd) { bd = d; bi = i; } });
@@ -550,8 +637,10 @@ cv.addEventListener('pointerup', (e) => {
   const p = evPt(e);
   const wasCorner = dragCorner >= 0, wasBall = dragBall;
   dragCorner = -1; dragBall = null;
+  clearTimeout(pressTimer);
   if (!downPt) return;
   downPt = null;
+  if (longDone) return;
   if (moved) {
     if (wasCorner && S.mode === 'photo' && S.frozen) analyzeFrozen(false);
     if (wasBall) requestAnalysis(true);
@@ -559,7 +648,21 @@ cv.addEventListener('pointerup', (e) => {
   }
   if (S.editCorners) return;
   if (S.editBalls) { if (S.calib) openBallSheet(ballAtScreen(p), screenToTable(p)); return; }
-  const b = ballAtScreen(p);
+  if (!S.calib) { toast('עוד לא זוהה שולחן'); return; }
+  let b = ballAtScreen(p);
+  const dScr = (q) => { const s2 = scrOf(q); return Math.hypot(s2.x - p.x, s2.y - p.y); };
+  // if the tap is not right on a marked ball, look at the image there
+  if (!b || dScr(b) > 0.8 * R.ballRadiusScr(b, S.calib.Hb)) {
+    const t = screenToTable(p);
+    const inside = t.x > -30 && t.y > -30 && t.x < TABLE.L + 30 && t.y < TABLE.W + 30;
+    const r = inside ? tapFind(R.scr2fr(p), false) : null;
+    const dup = r && S.balls.find((o) => Math.hypot(o.x - r.ball.x, o.y - r.ball.y) < TABLE.R * 1.2);
+    if (r && dup) b = dup;
+    else if (r && (r.found || !b) && (!b || dScr(r.ball) < dScr(b))) {
+      b = commitTap(r.ball, r.found).ball;
+      toast(r.found ? `סימנתי ${BALL_HE[b.color]} · לחיצה ארוכה לשינוי צבע` : `סימנתי כדור ידנית (${BALL_HE[b.color]}) · לחיצה ארוכה לשינוי צבע`);
+    }
+  }
   if (b) {
     S.selId = b.id; S.showRec = false;
     if (b.color === 'white') toast('זה הלבן – גע בכדור שאתה רוצה להכניס');
@@ -585,14 +688,18 @@ function openBallSheet(ball, tpos) {
   if (ball) {
     openSheet(`כדור ${BALL_HE[ball.color]}`, `${colorButtons()}<div class="row"><button class="btn" id="delBall" style="width:100%;color:#ff8a8a">🗑 מחק כדור</button></div>`);
     $('#sheetBody').querySelectorAll('[data-c]').forEach((b) => { b.onclick = () => { setColor(ball, b.dataset.c); closeSheet(); }; });
-    $('#delBall').onclick = () => { S.balls = S.balls.filter((x) => x !== ball); if (S.selId === ball.id) S.selId = null; closeSheet(); requestAnalysis(true); };
+    $('#delBall').onclick = () => {
+      S.balls = S.balls.filter((x) => x.id !== ball.id); S.tracks = (S.tracks || []).filter((x) => x.id !== ball.id);
+      S.ignore = (S.ignore || []).concat([{ x: ball.x, y: ball.y }]);
+      if (S.selId === ball.id) S.selId = null; closeSheet(); requestAnalysis(true);
+    };
   } else {
     if (tpos.x < 0 || tpos.y < 0 || tpos.x > TABLE.L || tpos.y > TABLE.W) { toast('הנקודה מחוץ לשולחן'); return; }
     openSheet('הוסף כדור כאן', colorButtons());
     $('#sheetBody').querySelectorAll('[data-c]').forEach((b) => {
       b.onclick = () => {
-        const nb = { id: S.nextId++, color: 'red', x: Math.min(TABLE.L - TABLE.R, Math.max(TABLE.R, tpos.x)), y: Math.min(TABLE.W - TABLE.R, Math.max(TABLE.R, tpos.y)) };
-        S.balls.push(nb); setColor(nb, b.dataset.c); closeSheet();
+        const nb = { id: S.nextId++, color: 'red', manual: true, hits: 99, miss: 0, x: Math.min(TABLE.L - TABLE.R, Math.max(TABLE.R, tpos.x)), y: Math.min(TABLE.W - TABLE.R, Math.max(TABLE.R, tpos.y)) };
+        S.balls.push(nb); if (S.mode !== 'photo') S.tracks.push(nb); setColor(nb, b.dataset.c); closeSheet();
       };
     });
   }
@@ -600,7 +707,8 @@ function openBallSheet(ball, tpos) {
 
 function setColor(ball, c) {
   if (c !== 'red') for (const o of S.balls) if (o !== ball && o.color === c) o.color = 'red';
-  ball.color = c;
+  ball.color = c; ball.manual = true;
+  for (const t of S.tracks || []) if (t.id === ball.id) { t.color = c; t.manual = true; }
   requestAnalysis(true);
 }
 
@@ -662,7 +770,7 @@ bindSeg('#segPower', 'power');
 function setMode(m) {
   S.mode = m;
   S.frozen = null; S.editBalls = false; S.editCorners = false; S.locked = false;
-  S.balls = []; S.selId = null; S.shots = []; S.showRec = false; S.quad = null; S.calib = null; S.orient = 'auto'; S.quadHistory = [];
+  S.balls = []; S.tracks = []; S.ignore = []; S.lost = 0; S.selId = null; S.shots = []; S.showRec = false; S.quad = null; S.calib = null; S.orient = 'auto'; S.quadHistory = [];
   document.querySelectorAll('#modes button').forEach((b) => b.classList.toggle('on', b.dataset.mode === m));
   const tips = {
     photo: 'צלם את השולחן, ואז גע בכדור',
@@ -674,26 +782,19 @@ function setMode(m) {
 }
 document.querySelectorAll('#modes button').forEach((b) => { b.onclick = () => setMode(b.dataset.mode); });
 
-function setSource(s) {
-  S.source = s;
-  $('#btnSource').textContent = s === 'demo' ? '🎮 דמו' : '🎥 מצלמה';
-  setMode(S.mode);
-}
-$('#btnSource').onclick = () => setSource(S.source === 'demo' ? 'camera' : 'demo');
-
 // ---------------- boot ----------------
 async function boot() {
-  const params = new URLSearchParams(location.search);
   renderActions(); renderStatus();
   requestAnimationFrame(frame);
-  if (params.has('demo')) { setSource('demo'); return; }
   try {
     await startCamera();
     S.camError = null;
+    setMode(S.mode);
   } catch (e) {
-    S.camError = 'אין גישה למצלמה – עובר לדמו';
-    toast('אין גישה למצלמה. אפשר לנסות במצב דמו');
-    setSource('demo');
+    S.camError = 'אין גישה למצלמה – אשר הרשאת מצלמה לאפליקציה ונסה שוב';
+    renderStatus();
+    const a = $('#actions'); a.innerHTML = '';
+    a.append(btn('🎥 נסה שוב', 'primary', () => location.reload()));
   }
   renderStatus();
 }
@@ -701,8 +802,7 @@ boot();
 
 // test hooks (used by the automated checks)
 window.__snooker = {
-  S, demo,
-  setMode, setSource, capturePhoto,
+  S, setMode, capturePhoto,
   select(color) { const b = S.balls.find((x) => x.color === color); if (b) { S.selId = b.id; requestAnalysis(true); } return b; },
-  truth() { return demo.balls; },
+  tapFrame(pt) { return tapFind(pt); },
 };

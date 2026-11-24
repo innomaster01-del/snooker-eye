@@ -1,7 +1,7 @@
 // Synthetic snooker table rendered in perspective, used as a stand-in camera
 // (demo mode) and for automated accuracy tests. Ground truth is exposed.
-import { TABLE } from './geom.js';
-import { BALL_HEX } from './vision.js';
+import { TABLE } from '../js/geom.js';
+import { BALL_HEX } from '../js/vision.js';
 
 const { L, W, R } = TABLE;
 
@@ -51,10 +51,17 @@ export class DemoCamera {
   }
 
   makeNoise() {
-    const c = document.createElement('canvas'); c.width = 128; c.height = 128;
-    const x = c.getContext('2d'); const d = x.createImageData(128, 128);
-    for (let i = 0; i < d.data.length; i += 4) { const v = 120 + Math.random() * 30; d.data[i] = d.data[i + 1] = d.data[i + 2] = v; d.data[i + 3] = 14; }
-    x.putImageData(d, 0, 0); return c;
+    this.noiseTiles = [];
+    for (let k = 0; k < 4; k++) {
+      const c = document.createElement('canvas'); c.width = 128; c.height = 128;
+      const x = c.getContext('2d'); const d = x.createImageData(128, 128);
+      for (let i = 0; i < d.data.length; i += 4) {
+        const v = Math.random() < 0.5 ? 0 : 255;
+        d.data[i] = v; d.data[i + 1] = Math.random() < 0.5 ? 0 : 255; d.data[i + 2] = v; d.data[i + 3] = 10 + Math.random() * 22;
+      }
+      x.putImageData(d, 0, 0); this.noiseTiles.push(c);
+    }
+    return this.noiseTiles[0];
   }
 
   proj(P) {
@@ -123,11 +130,26 @@ export class DemoCamera {
       gr.addColorStop(0, '#ffffff'); gr.addColorStop(0.18, base); gr.addColorStop(0.85, base); gr.addColorStop(1, shade(base, 0.55));
       c.fillStyle = gr; c.beginPath(); c.arc(p.x, p.y, r, 0, Math.PI * 2); c.fill();
     }
-    // sensor noise
-    c.save(); c.globalAlpha = 1;
-    for (let y = 0; y < h; y += 128) for (let x = 0; x < w; x += 128) c.drawImage(this.noise, x, y);
-    c.restore();
-    return this.canvas;
+    // a cue lying on the cloth and a chalk cube on the rail (must not become balls)
+    const c1 = this.proj([1150, 260, 15]), c2 = this.proj([2350, 120, 15]);
+    c.strokeStyle = '#c9a36a'; c.lineWidth = Math.max(2, this.f * 13 / c1.z); c.lineCap = 'round';
+    c.beginPath(); c.moveTo(c1.x, c1.y); c.lineTo(c2.x, c2.y); c.stroke();
+    this.polyPlane([[2000, W + 60, 1], [2030, W + 60, 1], [2030, W + 90, 1], [2000, W + 90, 1]], '#2a6fd0');
+    // overhead lamp hot spots
+    for (const lx of [L * 0.25, L * 0.5, L * 0.75]) {
+      const q = this.proj([lx, W / 2, 0]);
+      const rg = c.createRadialGradient(q.x, q.y, 0, q.x, q.y, w * 0.12);
+      rg.addColorStop(0, 'rgba(255,255,230,0.16)'); rg.addColorStop(1, 'rgba(255,255,230,0)');
+      c.fillStyle = rg; c.fillRect(0, 0, w, h);
+    }
+    // sensor noise (changes every frame) + slight blur like a real phone stream
+    this.tick = (this.tick || 0) + 1;
+    const tile = this.noiseTiles[this.tick % this.noiseTiles.length];
+    for (let y = 0; y < h; y += 128) for (let x = 0; x < w; x += 128) c.drawImage(tile, x, y);
+    if (!this.out) { this.out = document.createElement('canvas'); this.out.width = w; this.out.height = h; this.octx = this.out.getContext('2d'); }
+    this.octx.filter = 'blur(0.7px)';
+    this.octx.drawImage(this.canvas, 0, 0);
+    return this.out;
   }
 }
 
