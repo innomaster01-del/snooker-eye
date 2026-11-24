@@ -65,6 +65,17 @@ async function run(viewport, name) {
   await page.evaluate(() => { window.__snooker.S.selId = null; document.querySelector('#actions .btn:nth-child(2)').click(); });
   await page.waitForTimeout(2500);
   await page.screenshot({ path: path.join(out, `${name}-3-rec.png`) });
+  // tip selector sheet + manual side spin
+  await page.evaluate(() => document.querySelector('#tipBtn').click());
+  await page.waitForTimeout(300);
+  await page.screenshot({ path: path.join(out, `${name}-3b-tipsheet.png`) });
+  await page.evaluate(() => { const S = window.__snooker.S; S.set.tip = { x: 0.3, y: -0.3 }; S.set.elev = 20; document.querySelector('#sheetClose').click(); window.__snooker.select('brown'); });
+  await page.waitForTimeout(2500);
+  const manual = await page.evaluate(() => { const s = window.__snooker.S.shots[0]; return s ? { tip: s.tip, side: s.play.side, thr: s.play.throwDeg, spin: s.spin } : null; });
+  console.log(`[${name}] manual tip`, JSON.stringify(manual));
+  if (!manual) fail++;
+  await page.screenshot({ path: path.join(out, `${name}-3c-manual.png`) });
+  await page.evaluate(() => { window.__snooker.S.set.tip = 'auto'; window.__snooker.S.set.elev = 8; });
   // tripod live
   await page.evaluate(() => window.__snooker.setMode('tripod'));
   await page.waitForTimeout(1500);

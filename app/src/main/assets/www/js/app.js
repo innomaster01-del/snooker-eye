@@ -4,8 +4,9 @@ import { TABLE, applyH, v } from './geom.js';
 import {
   detectTable, calibrate, detectBalls, alignQuad, hsvArrays, BALL_HE, BALL_HEX, BALL_COLORS,
 } from './vision.js';
-import { thicknessLabel, SPIN_HE, POCKETS } from './shots.js';
+import { thicknessLabel, POCKETS } from './shots.js';
 import { Renderer } from './render.js';
+import { ballSVG, elevationSVG, tipWords, tipMm, mountTipPad } from './tip.js';
 import { DemoCamera } from './demo.js';
 
 const $ = (s) => document.querySelector(s);
@@ -16,11 +17,11 @@ const proc = document.createElement('canvas');
 const pctx = proc.getContext('2d', { willReadFrequently: true });
 
 // ---------------- state ----------------
-const DEFAULTS = { power: 'auto', spin: 'auto', on: 'free', skill: 0.15, maxCush: 2, margin: 45, minimap: true, alts: true };
+const DEFAULTS = { power: 'auto', tip: 'auto', elev: 8, on: 'free', skill: 0.15, maxCush: 2, margin: 45, minimap: true, alts: true };
 function loadSettings() {
-  try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('se.settings.v2') || '{}') }; } catch { return { ...DEFAULTS }; }
+  try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('se.settings.v3') || '{}') }; } catch { return { ...DEFAULTS }; }
 }
-function saveSettings() { try { localStorage.setItem('se.settings.v2', JSON.stringify(S.set)); } catch { /* storage unavailable */ } }
+function saveSettings() { try { localStorage.setItem('se.settings.v3', JSON.stringify(S.set)); } catch { /* storage unavailable */ } }
 
 const S = {
   mode: 'photo', source: 'camera', camReady: false, camError: null,
@@ -55,7 +56,8 @@ function analysisOpts() {
   const mode = st.on === 'free' ? { kind: 'free' } : { kind: 'snooker', on: st.on };
   const target = S.selId != null && S.balls.find((b) => b.id === S.selId && b.color !== 'white') ? S.selId : null;
   return {
-    targetId: target, mode, power: st.power === 'auto' ? 'auto' : Number(st.power), spin: st.spin,
+    targetId: target, mode, power: st.power === 'auto' ? 'auto' : Number(st.power), tip: st.tip, elev: Number(st.elev),
+    hand: S.calib && S.calib.pose ? S.calib.pose.hand : 1,
     sigmaDeg: Number(st.skill), maxCushions: Number(st.maxCush), limit: 6,
   };
 }
@@ -315,15 +317,62 @@ function shotBadge(s) {
   return `${Math.round(s.cut)}° ${cutSide(s)} · ${thicknessLabel(s.cut)} · ${pct(s.pPot)}`;
 }
 
-function tipFor(s) {
-  const far = s.cueDist > 1500;
-  if (s.spin === 'follow') return 'פגע בלבן מעל המרכז';
-  if (s.spin === 'stun') return far ? 'פגע בלבן מעט מתחת למרכז' : 'פגע בלבן במרכז';
-  return far ? 'פגע בלבן נמוך מאוד, מכה חדה' : 'פגע בלבן מתחת למרכז';
+function howTo(cur) {
+  const tip = cur.tip || { x: 0, y: 0 };
+  const pl = cur.play || {};
+  const extra = [];
+  const side = pl.side;
+  if (side && Math.abs(side.netMm) >= 1) {
+    const towards = tip.x > 0 ? 'ימינה' : 'שמאלה';
+    const away = tip.x > 0 ? 'שמאלה' : 'ימינה';
+    extra.push(side.netMm > 0
+      ? `צד: הלבן יברח ~${Math.round(side.netMm)} מ״מ ${away} → כוון ${Math.round(side.netMm)} מ״מ ${towards}`
+      : `קירוס: הלבן יתעקם ~${Math.round(-side.netMm)} מ״מ ${towards} → כוון ${Math.round(-side.netMm)} מ״מ ${away}`);
+  }
+  if (pl.throwDeg >= 0.7 && cur.cut > 3) {
+    const mm = (2 * TABLE.R * Math.sin(pl.throwDeg * Math.PI / 180)).toFixed(1);
+    extra.push(`זריקה ~${pl.throwDeg.toFixed(1)}°: חתוך מעט דק יותר (~${mm} מ״מ)`);
+  }
+  return `<div class="howto">
+    ${ballSVG(tip, 66, { showCentre: true })}
+    <div class="lines">נקודת פגיעה: <b>${tipWords(tip)}</b><br>${tipMm(tip)}<br>גובה מקל: <b>${Math.round(S.set.elev)}°</b> · כוח <b>${cur.power}/5</b></div>
+  </div>${extra.map((x) => `<div class="tip" style="color:#ffcf6b">${x}</div>`).join('')}`;
 }
+
+function renderTipBtn() {
+  const b = $('#tipBtn');
+  const cur = S.shots[S.shotIdx];
+  const auto = S.set.tip === 'auto';
+  const tip = auto ? (cur && cur.tip) : S.set.tip;
+  b.innerHTML = (tip ? ballSVG(tip, 46, { guides: false, showCentre: true }) : ballSVG('auto', 46, { guides: false })) + (auto ? '<span class="badge">A</span>' : '');
+}
+
+function openTipSheet() {
+  const st = S.set;
+  openSheet('נקודת פגיעה בלבן', `
+    <div class="tipgrid"><div>
+    <div class="tiphead" id="tipHead">${tipWords(st.tip)}</div>
+    <div id="tipPadBox"></div></div><div>
+    <div class="btnrow"><button class="btn" id="tipCentre">מרכז הכדור</button><button class="btn ${st.tip === 'auto' ? 'primary' : ''}" id="tipAuto">אוטומטי (האפליקציה בוחרת)</button></div>
+    <div class="row"><div class="lbl">גובה המקל: <b id="elevV">${st.elev}</b>°</div>
+      <div class="elevrow"><div id="elevPic">${elevationSVG(st.elev)}</div><input type="range" id="elev" min="0" max="45" step="1" value="${st.elev}"></div>
+      <div class="hint">מקל שטוח (5–10°) = מכה נקייה. מקל גבוה + צד = הלבן מתעקם (קירוס).</div></div>
+    <div class="row hint">העיגול המקווקו = גבול בטוח (מעבר לו יש סכנת החלקה). עיגול פנימי = גובה לגלגול טבעי.</div></div></div>`);
+  $('#sheet .sheet-card').classList.add('tipcard');
+  const box = $('#tipPadBox');
+  const pad = mountTipPad(box, st.tip, (t) => { $('#tipHead').textContent = tipWords(t); },
+    (t) => { S.set.tip = t; saveSettings(); $('#tipAuto').classList.remove('primary'); renderTipBtn(); requestAnalysis(true); });
+  $('#tipCentre').onclick = () => { S.set.tip = { x: 0, y: 0 }; saveSettings(); pad.set(S.set.tip); $('#tipHead').textContent = tipWords(S.set.tip); $('#tipAuto').classList.remove('primary'); renderTipBtn(); requestAnalysis(true); };
+  $('#tipAuto').onclick = () => { S.set.tip = 'auto'; saveSettings(); $('#tipHead').textContent = tipWords('auto'); $('#tipAuto').classList.add('primary'); renderTipBtn(); requestAnalysis(true); };
+  const el = $('#elev');
+  el.oninput = () => { $('#elevV').textContent = el.value; $('#elevPic').innerHTML = elevationSVG(Number(el.value)); };
+  el.onchange = () => { S.set.elev = Number(el.value); saveSettings(); requestAnalysis(true); };
+}
+$('#tipBtn').onclick = openTipSheet;
 
 // ---------------- panel ----------------
 function renderPanel() {
+  renderTipBtn();
   const panel = $('#panel');
   const cur = S.shots[S.shotIdx];
   const hasTarget = S.selId != null;
@@ -345,16 +394,17 @@ function renderPanel() {
   if (after && after.scratch != null) afterTxt = '⚠️ הלבן ייכנס לכיס – שנה כוח/סיבוב';
   else if (after && after.kiss != null) afterTxt = 'הלבן ייתקל בכדור אחר';
   $('#pBody').innerHTML = `
+    ${howTo(cur)}
     <div class="kv">
-      <span class="k">סוג</span><span class="v">${typeHe}${cur.cueCush ? ` (${cur.cueCush} גומי)` : ''}</span>
-      <span class="k">זווית חיתוך</span><span class="v big">${Math.round(cur.cut)}° ${cutSide(cur)}</span>
-      <span class="k">עובי פגיעה</span><span class="v">${thicknessLabel(cur.cut)}</span>
+      <span class="k">סוג</span><span class="v wide">${typeHe}${cur.cueCush ? ` (${cur.cueCush} גומי)` : ''}</span>
+      <span class="k">חיתוך</span><span class="v big">${Math.round(cur.cut)}° ${cutSide(cur)}</span>
+      <span class="k">עובי</span><span class="v">${thicknessLabel(cur.cut)}</span>
       <span class="k">כוח</span><span class="v">${'●'.repeat(cur.power)}${'○'.repeat(5 - cur.power)} ${cur.power}/5</span>
-      <span class="k">סיבוב</span><span class="v">${SPIN_HE[cur.spin]}</span>
-      <span class="k">סיכוי להכניס</span><span class="v">${pct(cur.pPot)}<div class="bar"><i style="width:${pct(cur.pPot)}"></i></div></span>
-      ${cur.nextP > 0 ? `<span class="k">עמדה לבא</span><span class="v">${pct(cur.nextP)}</span>` : ''}
+      <span class="k">בפגיעה</span><span class="v">${({ follow: 'עליון', stun: 'סטופ', draw: 'אחורי' })[cur.spin]}</span>
+      <span class="k">סיכוי</span><span class="v">${pct(cur.pPot)}<div class="bar"><i style="width:${pct(cur.pPot)}"></i></div></span>
+      ${cur.nextP > 0 ? `<span class="k">לכדור הבא</span><span class="v">${pct(cur.nextP)}</span>` : ''}
     </div>
-    <div class="tip">🎯 כוון את הלבן למרכז העיגול הלבן · ${tipFor(cur)}</div>
+    <div class="tip">🎯 כוון את הלבן למרכז העיגול הלבן</div>
     <div class="tip">${afterTxt}</div>
     ${cur.play && !cur.play.objReach ? '<div class="tip" style="color:#ff8a8a">הכוח חלש מדי להגיע לכיס</div>' : ''}`;
   $('#pCount').textContent = `${S.shotIdx + 1} / ${S.shots.length}`;
@@ -520,6 +570,7 @@ cv.addEventListener('pointerup', (e) => {
 
 // ---------------- sheets ----------------
 function openSheet(title, html) {
+  $('#sheet .sheet-card').classList.remove('tipcard');
   $('#sheetTitle').textContent = title; $('#sheetBody').innerHTML = html; $('#sheet').hidden = false;
 }
 function closeSheet() { $('#sheet').hidden = true; }
@@ -606,7 +657,6 @@ function bindSeg(id, key) {
   });
 }
 bindSeg('#segPower', 'power');
-bindSeg('#segSpin', 'spin');
 
 // ---------------- modes / source ----------------
 function setMode(m) {

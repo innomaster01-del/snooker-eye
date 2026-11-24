@@ -139,9 +139,10 @@ export function poseFromH(H, f, cx, cy) {
   let r3 = c3(r1, r2);
   const nr3 = n3(r3) || 1; r3 = r3.map((x) => x / nr3);
   // r3 must point from table towards the camera (camera at origin): r3 . t < 0
-  if (d3(r3, t) > 0) r3 = r3.map((x) => -x);
-  const camHeightDir = r3;
-  return { f, cx, cy, r1, r2, r3: camHeightDir, t };
+  let hand = 1;
+  if (d3(r3, t) > 0) { r3 = r3.map((x) => -x); hand = -1; }
+  // hand = +1 when (x, y, up) is a right-handed frame in the real world
+  return { f, cx, cy, r1, r2, r3, t, hand };
 }
 
 export function liftedH(pose, zh) {

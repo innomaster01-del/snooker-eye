@@ -10,7 +10,6 @@ const G = 9810, MU_S = 0.2, MU_R = 0.012, A_R = MU_R * G, E_CUSH = 0.72;
 export const POWER_DIST = [0, 600, 1500, 3000, 5000, 8000]; // free rolling distance per power level
 const speedFor = (p) => Math.sqrt(2 * A_R * POWER_DIST[p]);
 
-export const SPIN = { follow: 1, stun: 0, draw: -0.85 };
 export const SPIN_HE = { follow: 'עליון (follow)', stun: 'סטופ (stun)', draw: 'אחורי (draw)' };
 export const COLOR_ORDER = ['yellow', 'green', 'brown', 'blue', 'pink', 'black'];
 
@@ -88,8 +87,8 @@ export function thicknessLabel(cutDeg) {
 }
 
 // Simulate the cue ball after contact. Returns path & end state.
-export function simulateCue(start, vel0, spin0, balls, ignore) {
-  let p = { ...start }, vel = { ...vel0 }, w = { ...spin0 };
+export function simulateCue(start, vel0, spin0, balls, ignore, side0 = 0) {
+  let p = { ...start }, vel = { ...vel0 }, w = { ...spin0 }, ws = side0;
   const path = [{ ...p }];
   const dt = 0.004;
   let last = { ...p }, scratch = null, kiss = null, cushions = 0;
@@ -116,12 +115,22 @@ export function simulateCue(start, vel0, spin0, balls, ignore) {
     }
     if (scratch != null) { path.push({ ...p }); break; }
     // cushions
-    let bounced = false;
-    if (p.x < R) { p.x = 2 * R - p.x; vel.x = -vel.x * E_CUSH; w.x = -w.x * E_CUSH; vel.y *= 0.92; bounced = true; }
-    if (p.x > L - R) { p.x = 2 * (L - R) - p.x; vel.x = -vel.x * E_CUSH; w.x = -w.x * E_CUSH; vel.y *= 0.92; bounced = true; }
-    if (p.y < R) { p.y = 2 * R - p.y; vel.y = -vel.y * E_CUSH; w.y = -w.y * E_CUSH; vel.x *= 0.92; bounced = true; }
-    if (p.y > W - R) { p.y = 2 * (W - R) - p.y; vel.y = -vel.y * E_CUSH; w.y = -w.y * E_CUSH; vel.x *= 0.92; bounced = true; }
-    if (bounced) { cushions++; path.push({ ...p }); last = { ...p }; }
+    let bounced = false, n = null;
+    if (p.x < R) { p.x = 2 * R - p.x; vel.x = -vel.x * E_CUSH; w.x = -w.x * E_CUSH; vel.y *= 0.92; bounced = true; n = { x: 1, y: 0 }; }
+    if (p.x > L - R) { p.x = 2 * (L - R) - p.x; vel.x = -vel.x * E_CUSH; w.x = -w.x * E_CUSH; vel.y *= 0.92; bounced = true; n = { x: -1, y: 0 }; }
+    if (p.y < R) { p.y = 2 * R - p.y; vel.y = -vel.y * E_CUSH; w.y = -w.y * E_CUSH; vel.x *= 0.92; bounced = true; n = { x: 0, y: 1 }; }
+    if (p.y > W - R) { p.y = 2 * (W - R) - p.y; vel.y = -vel.y * E_CUSH; w.y = -w.y * E_CUSH; vel.x *= 0.92; bounced = true; n = { x: 0, y: -1 }; }
+    if (bounced) {
+      // side spin grips the cushion: tangential kick along z x n, then most of it is used up
+      if (n && Math.abs(ws) > 1) {
+        const tz = { x: -n.y, y: n.x };
+        const kick = v.mul(tz, 0.28 * ws);
+        vel = v.add(vel, kick); w = v.add(w, kick);
+        ws *= 0.45;
+      }
+      cushions++; path.push({ ...p }); last = { ...p };
+    }
+    ws *= Math.exp(-dt / 3);
     // other balls
     for (const bl of balls) {
       if (ignore.includes(bl.id)) continue;
@@ -268,34 +277,82 @@ export function findShots(balls, opts = {}) {
   return shots;
 }
 
-// Speed bookkeeping and cue-ball after-path for a chosen power/spin.
-export function playShot(shot, balls, power, spinKey) {
+// Cue tip position: x = side (+ right as the player sees it), y = height
+// (+ above centre), both as a fraction of the ball radius. 0.4 = natural roll.
+export const TIP_LIMIT = 0.6;
+export const AUTO_TIPS = [0.5, 0.25, 0, -0.25, -0.5].map((y) => ({ x: 0, y }));
+
+// Approach phase along a straight line: sliding -> rolling (Han 2005 style).
+function approach(v0, b, dist) {
+  let vv = v0, w = 2.5 * b * v0, s = 0, t = 0, tSlide = 0;
+  const dt = 0.002;
+  while (s < dist) {
+    const slip = vv - w;
+    if (Math.abs(slip) > 2) {
+      const dv = MU_S * G * dt * Math.sign(slip);
+      if (3.5 * Math.abs(dv) >= Math.abs(slip)) { const f = (5 * vv + 2 * w) / 7; vv = f; w = f; }
+      else { vv -= dv; w += 2.5 * dv; }
+      tSlide = t;
+    } else { vv = Math.max(0, vv - A_R * dt); w = vv; }
+    s += vv * dt; t += dt;
+    if (vv < 30) return { reach: false };
+    if (t > 20) return { reach: false };
+  }
+  return { reach: true, vc: vv, wc: w, t, tSlide };
+}
+
+export function spinName(s) { return s > 0.55 ? 'follow' : (s > -0.2 ? 'stun' : 'draw'); }
+
+// Collision-induced throw (deg) for a given cut and spin ratio at contact.
+function throwDeg(cutDeg, s) {
+  const c = cutDeg * Math.PI / 180;
+  const base = Math.min(2.8, 6.5 * Math.sin(c) * Math.cos(c));
+  return base * (Math.abs(s) < 0.3 ? 1 : 0.55);
+}
+
+// Deflection of the cue ball by side spin: squirt (away from the side used)
+// minus swerve (back towards it, grows with cue elevation). mm at the ghost.
+function sideCorrection(tip, elevDeg, dist, ap) {
+  if (!tip.x) return { squirtDeg: 0, swerveMm: 0, netMm: 0 };
+  const a = tip.x;
+  const squirtDeg = 4.8 * Math.abs(a);
+  const squirtMm = dist * Math.tan(squirtDeg * Math.PI / 180);
+  const tS = Math.min(ap.t, Math.max(ap.tSlide, 0.25));
+  const acc = MU_S * G * 0.5 * Math.abs(a) * Math.sin(elevDeg * Math.PI / 180);
+  const swerveMm = Math.min(squirtMm * 1.5, 0.5 * acc * tS * tS);
+  return { squirtDeg, swerveMm, netMm: squirtMm - swerveMm };
+}
+
+// Speed bookkeeping and cue-ball after-path for a chosen power/tip.
+export function playShot(shot, balls, power, tip, elevDeg = 8, hand = 1) {
   const v0 = speedFor(power);
-  const cueTravel = shot.cueDist;
-  let vc = Math.sqrt(Math.max(0, v0 * v0 - 2 * A_R * cueTravel)) * Math.pow(0.8, shot.cueCush || 0);
-  if (vc < 40) return { reach: false };
+  const ap = approach(v0, tip.y, shot.cueDist);
+  if (!ap.reach) return { reach: false };
+  const loss = Math.pow(0.8, shot.cueCush || 0);
+  const vc = ap.vc * loss, wc = ap.wc * loss;
   const theta = shot.cut * Math.PI / 180;
-  // object speed
   let vObj = vc * Math.cos(theta) * 0.95;
-  let objReach;
   if (shot.type === 'combo') {
     const v1 = Math.sqrt(Math.max(0, vObj * vObj - 2 * A_R * v.dist(shot.midPath[0], shot.midPath[1])));
     vObj = v1 * Math.cos(shot.cut2 * Math.PI / 180) * 0.95;
   }
   const need = 2 * A_R * (shot.objDist + 40) / Math.pow(E_CUSH, 2 * (shot.objCush || 0));
-  objReach = vObj * vObj >= need;
+  const objReach = vObj * vObj >= need;
   const dIn = shot.dIn, u = shot.u;
   let t = v.sub(dIn, v.mul(u, v.dot(dIn, u)));
   const tl = v.len(t);
   t = tl > 1e-6 ? v.mul(t, 1 / tl) : { x: 0, y: 0 };
-  // spin decays a little with distance for draw/stun (needs a firmer stroke)
-  let s = SPIN[spinKey];
-  if (s < 1) s = 1 + (s - 1) * Math.exp(-cueTravel / 2600);
   const vel = v.mul(t, vc * Math.sin(theta));
-  const w = v.mul(dIn, s * vc);
+  const w = v.mul(dIn, wc);
+  // side spin about the vertical axis; right-hand side = clockwise from above
+  const side0 = -hand * 2.5 * tip.x * v0 * Math.exp(-ap.t / 3) * loss;
   const ignore = [balls.find((b) => b.color === 'white')?.id, shot.target, shot.firstBall].filter((x) => x != null);
-  const sim = simulateCue(shot.ghost, vel, w, balls, ignore);
-  return { reach: true, objReach, vc, vObj, after: sim };
+  const sim = simulateCue(shot.ghost, vel, w, balls, ignore, side0);
+  const sRatio = vc > 0 ? wc / vc : 0;
+  return {
+    reach: true, objReach, vc, vObj, after: sim, spinRatio: sRatio, spinKind: spinName(sRatio),
+    throwDeg: throwDeg(shot.cut, sRatio), side: sideCorrection(tip, elevDeg, shot.cueDist, ap),
+  };
 }
 
 export function nextBallOn(potColor, balls, mode) {
@@ -337,8 +394,8 @@ function bestDirectFrom(E, balls, colors, removedIds, sigmaDeg) {
 // Full analysis: returns ranked shots with chosen power/spin and after-paths.
 export function analyze(balls, opts = {}) {
   const {
-    targetId = null, mode = { kind: 'free' }, power = 'auto', spin = 'auto', sigmaDeg = 0.7, maxCushions = 2,
-    limit = 8,
+    targetId = null, mode = { kind: 'free' }, power = 'auto', tip = 'auto', sigmaDeg = 0.15, maxCushions = 2,
+    limit = 8, elev = 8, hand = 1,
   } = opts;
   let targetIds = null;
   if (targetId != null) targetIds = [targetId];
@@ -357,14 +414,14 @@ export function analyze(balls, opts = {}) {
   shots.sort((a, b) => b.p - a.p);
   shots = shots.slice(0, Math.max(limit * 2, 12));
   const powers = power === 'auto' ? [1, 2, 3, 4, 5] : [power];
-  const spins = spin === 'auto' ? ['follow', 'stun', 'draw'] : [spin];
+  const tips = tip === 'auto' ? AUTO_TIPS : [tip];
   const out = [];
   for (const s of shots) {
     let best = null;
     const nextColors = nextBallOn(s.targetColor, balls, mode.kind === 'free' ? { kind: 'snooker', on: 'auto' } : mode) || [];
     for (const pw of powers) {
-      for (const sp of spins) {
-        const r = playShot(s, balls, pw, sp);
+      for (const tp of tips) {
+        const r = playShot(s, balls, pw, tp, elev, hand);
         if (!r.reach) continue;
         let pPot = s.p * (r.objReach ? 1 : 0.05);
         // overly hard shots lose accuracy
@@ -377,7 +434,7 @@ export function analyze(balls, opts = {}) {
         }
         const value = BALL_VALUE[s.targetColor] || 1;
         let score = pPot * (value + 0.9 * nextP * Math.max(1, nextVal)) - (r.after.scratch != null ? 4 : 0) - (r.after.kiss != null ? 0.3 : 0);
-        if (!best || score > best.score) best = { score, power: pw, spin: sp, pPot, nextP, play: r };
+        if (!best || score > best.score) best = { score, power: pw, tip: tp, spin: r.spinKind, pPot, nextP, play: r };
       }
     }
     if (!best) continue;
