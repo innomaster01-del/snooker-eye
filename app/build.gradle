@@ -1,0 +1,46 @@
+plugins {
+    id 'com.android.application'
+}
+
+def runNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
+
+android {
+    namespace 'com.innomaster.snookereye'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.innomaster.snookereye'
+        minSdk 26
+        targetSdk 35
+        versionCode runNumber
+        versionName "1.0.${runNumber}"
+    }
+
+    signingConfigs {
+        release {
+            storeFile file('signing/snookereye.jks')
+            storePassword System.getenv("SE_STORE_PASSWORD") ?: 'snookereye'
+            keyAlias 'snookereye'
+            keyPassword System.getenv("SE_KEY_PASSWORD") ?: 'snookereye'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+        debug {
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.12.1'
+}

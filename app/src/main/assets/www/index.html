@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b1118">
+<title>Snooker Eye</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="stage">
+  <video id="vid" playsinline muted autoplay></video>
+  <canvas id="cv"></canvas>
+</div>
+
+<header id="top">
+  <div class="brand"><span class="dot"></span>Snooker Eye</div>
+  <nav id="modes" role="tablist">
+    <button data-mode="photo" class="on">📷 צילום</button>
+    <button data-mode="tripod">📐 חצובה</button>
+    <button data-mode="hand">✋ ביד</button>
+  </nav>
+  <div class="spacer"></div>
+  <button id="btnSource" class="chip" title="מקור תמונה">🎥 מצלמה</button>
+  <button id="btnSettings" class="icon" aria-label="הגדרות">⚙︎</button>
+</header>
+
+<div id="status" class="status">מפעיל מצלמה…</div>
+
+<aside id="panel" hidden>
+  <div class="ph">
+    <div id="pTitle" class="ptitle"></div>
+    <button id="pClose" class="icon sm" aria-label="סגור">✕</button>
+  </div>
+  <div id="pBody"></div>
+  <div class="pnav">
+    <button id="pPrev" class="icon sm">›</button>
+    <span id="pCount"></span>
+    <button id="pNext" class="icon sm">‹</button>
+  </div>
+  <div id="pList" class="plist"></div>
+</aside>
+
+<footer id="bottom">
+  <div id="actions" class="actions"></div>
+  <div class="quick">
+    <label>כוח</label>
+    <div class="seg" id="segPower">
+      <button data-v="auto" class="on">אוטו</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4">4</button><button data-v="5">5</button>
+    </div>
+    <label>סיבוב</label>
+    <div class="seg" id="segSpin">
+      <button data-v="auto" class="on">אוטו</button><button data-v="follow">עליון</button><button data-v="stun">סטופ</button><button data-v="draw">אחורי</button>
+    </div>
+  </div>
+</footer>
+
+<div id="sheet" class="sheet" hidden>
+  <div class="sheet-card">
+    <div class="sheet-h"><b id="sheetTitle"></b><button id="sheetClose" class="icon sm">✕</button></div>
+    <div id="sheetBody"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
